@@ -13,6 +13,11 @@
  * - On a POSIX host every absolute path addresses the remote host, so the
  *   picker is remote-only (the local filesystem is unreachable through it;
  *   it would share the remote path vocabulary).
+ * - Windows local listings also carry drive switching: a level that is itself
+ *   the root of a drive (`C:\`) is the nearest local equivalent of Explorer's
+ *   "This PC", so every other accessible drive root is returned as a jump
+ *   target there — a level's real children never name a sibling drive, which
+ *   is why the picker could not leave the launching drive before.
  * - Remote listings return directories only, name-sorted, symlinks to
  *   directories followed, `hidden` means dot-prefixed, and one level is
  *   bounded at `maxEntries` rows with `truncated` flagging a cut.
@@ -152,6 +157,68 @@ function boundedInsert<T extends { name: string }>(window: T[], candidate: T, ke
  */
 function fullyQualifiedWin32(path: string): boolean {
   return win32.isAbsolute(path) && /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/]+[^\\/])/.test(path)
+}
+
+/**
+ * True when `path` is the root of a Windows drive (`C:\`, `C:/`) — the closest
+ * local level to Explorer's "This PC", and therefore the only level whose
+ * children may legitimately name sibling drives.
+ * @param path - candidate absolute Windows path.
+ */
+function isWin32DriveRoot(path: string): boolean {
+  return /^[A-Za-z]:[\\/]$/.test(path)
+}
+
+/** Every drive letter Windows can assign (the probe set for one drive root). */
+const win32DriveLetters: string[] = Array.from({ length: 26 }, (_, index) => String.fromCharCode(65 + index))
+
+/**
+ * Bound on one drive-root probe. A letter that does not answer in time is
+ * absent from the level instead of stalling it: an unplugged mapping or an
+ * empty optical drive must not hold the dialog on a spinning state.
+ */
+const driveProbeTimeoutMs = 500
+
+/** Lifetime of a probed drive list; navigating around a drive root reuses one probe burst. */
+const driveProbeCacheMs = 10000
+
+/** The last drive probe: when it ran and the accessible roots it saw. */
+let lastDriveProbe: { at: number; roots: string[] } = { at: 0, roots: [] }
+
+/**
+ * Probe one candidate drive root over the local filesystem. A root that is
+ * absent, has no ready media, or is slower than {@link driveProbeTimeoutMs}
+ * reports null and simply does not appear as a row.
+ * @param letter - drive letter without its colon.
+ * @returns the drive root path (`D:\`), or null when it is not reachable now.
+ */
+async function probeDriveRoot(letter: string): Promise<string | null> {
+  const root = `${letter}:\\`
+  let expiry: NodeJS.Timeout | undefined
+  try {
+    const probe = stat(root).then((value) => (value.isDirectory() ? root : null), () => null)
+    const timeout = new Promise<null>((resolveTimeout) => {
+      expiry = setTimeout(() => resolveTimeout(null), driveProbeTimeoutMs)
+    })
+    return await Promise.race([probe, timeout])
+  } finally {
+    clearTimeout(expiry)
+  }
+}
+
+/**
+ * Accessible Windows drive roots, probed once per {@link driveProbeCacheMs}
+ * window so repeated navigation through a drive root does not re-stat every
+ * letter. Probes run concurrently and each is bounded on its own.
+ * @returns the reachable drive root paths, in letter order.
+ */
+async function win32DriveRoots(): Promise<string[]> {
+  const now = Date.now()
+  if (now - lastDriveProbe.at < driveProbeCacheMs) return lastDriveProbe.roots
+  const probed = await Promise.all(win32DriveLetters.map((letter) => probeDriveRoot(letter)))
+  const roots = probed.filter((root): root is string => root !== null)
+  lastDriveProbe = { at: now, roots }
+  return roots
 }
 
 /**
@@ -419,6 +486,24 @@ export class SshDirectoryPicker extends DirectoryPicker {
     }
     const entries: DirectoryEntry[] = []
     let truncated = evicted
+    // A drive root is the only local level where another drive can be
+    // reached at all: its real children live inside the current drive, so
+    // no listing of them can widen the browsable filesystem. The other
+    // accessible drive roots are therefore synthesised as rows here, which
+    // is what makes the drive switch in the browser's path tree work.
+    if (isWin32DriveRoot(target)) {
+      const current = target.slice(0, 2).toUpperCase()
+      const roots = await win32DriveRoots()
+      signal?.throwIfAborted()
+      for (const root of roots) {
+        if (root.slice(0, 2).toUpperCase() === current) continue
+        if (entries.length === this.config.maxEntries) {
+          truncated = true
+          break
+        }
+        entries.push({ name: root, path: root, hidden: false })
+      }
+    }
     for (const candidate of window) {
       signal?.throwIfAborted()
       const row = await localDirectoryRow(target, candidate.name, candidate.isDirectory, candidate.isSymbolicLink, signal)

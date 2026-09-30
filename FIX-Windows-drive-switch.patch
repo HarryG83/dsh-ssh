@@ -1,0 +1,133 @@
+# dsh-ssh/picker: Windows drive switch (lib/picker.js, against the shipped 0.3.0-pre artifact)
+--- a/lib/picker.js
++++ b/lib/picker.js
+@@ -10,12 +10,17 @@
+  *   is unchanged), the remote host appears as one pinned entry on the local
+  *   home level, and every POSIX-absolute path addresses the remote host —
+  *   the same routing rule as {@link SshRuntime.resolveRemoteCwd}.
+  * - On a POSIX host every absolute path addresses the remote host, so the
+  *   picker is remote-only (the local filesystem is unreachable through it;
+  *   it would share the remote path vocabulary).
++ * - Windows local listings also carry drive switching: a level that is itself
++ *   the root of a drive (`C:\`) is the nearest local equivalent of Explorer's
++ *   "This PC", so every other accessible drive root is returned as a jump
++ *   target there — a level's real children never name a sibling drive, which
++ *   is why the picker could not leave the launching drive before.
+  * - Remote listings return directories only, name-sorted, symlinks to
+  *   directories followed, `hidden` means dot-prefixed, and one level is
+  *   bounded at `maxEntries` rows with `truncated` flagging a cut.
+  * - `createDirectory` is non-recursive SFTP mkdir with an existence probe.
+  *
+  * Mount as its own row (`dsh-ssh/picker`): the directory-picker seam registers
+@@ -109,12 +114,67 @@ function boundedInsert(window, candidate, keep) {
+  * against the process's current drive, so they do not count.
+  * @param path - candidate path.
+  */
+ function fullyQualifiedWin32(path) {
+     return win32.isAbsolute(path) && /^(?:[A-Za-z]:[\\/]|[\\/]{2}[^\\/]+[\\/]+[^\\/])/.test(path);
+ }
++/**
++ * True when `path` is the root of a Windows drive (`C:\`, `C:/`) — the closest
++ * local level to Explorer's "This PC", and therefore the only level whose
++ * children may legitimately name sibling drives.
++ * @param path - candidate absolute Windows path.
++ */
++function isWin32DriveRoot(path) {
++    return /^[A-Za-z]:[\\/]$/.test(path);
++}
++/** Every drive letter Windows can assign (the probe set for one drive root). */
++const win32DriveLetters = Array.from({ length: 26 }, (_, index) => String.fromCharCode(65 + index));
++/**
++ * Bound on one drive-root probe. A letter that does not answer in time is
++ * absent from the level instead of stalling it: an unplugged mapping or an
++ * empty optical drive must not hold the dialog on a spinning state.
++ */
++const driveProbeTimeoutMs = 500;
++/** Lifetime of a probed drive list; navigating around a drive root reuses one probe burst. */
++const driveProbeCacheMs = 10000;
++/** The last drive probe: when it ran and the accessible roots it saw. */
++let lastDriveProbe = { at: 0, roots: [] };
++/**
++ * Probe one candidate drive root over the local filesystem. A root that is
++ * absent, has no ready media, or is slower than {@link driveProbeTimeoutMs}
++ * reports null and simply does not appear as a row.
++ * @param letter - drive letter without its colon.
++ * @returns the drive root path (`D:\`), or null when it is not reachable now.
++ */
++async function probeDriveRoot(letter) {
++    const root = `${letter}:\\`;
++    let expiry;
++    try {
++        const probe = stat(root).then((value) => value.isDirectory() ? root : null, () => null);
++        const timeout = new Promise((resolveTimeout) => { expiry = setTimeout(() => resolveTimeout(null), driveProbeTimeoutMs); });
++        return await Promise.race([probe, timeout]);
++    }
++    finally {
++        clearTimeout(expiry);
++    }
++}
++/**
++ * Accessible Windows drive roots, probed once per {@link driveProbeCacheMs}
++ * window so repeated navigation through a drive root does not re-stat every
++ * letter. Probes run concurrently and each is bounded on its own.
++ * @returns the reachable drive root paths, in letter order.
++ */
++async function win32DriveRoots() {
++    const now = Date.now();
++    if (now - lastDriveProbe.at < driveProbeCacheMs)
++        return lastDriveProbe.roots;
++    const probed = await Promise.all(win32DriveLetters.map((letter) => probeDriveRoot(letter)));
++    const roots = probed.filter((root) => root !== null);
++    lastDriveProbe = { at: now, roots };
++    return roots;
++}
+ /**
+  * Ancestor chain from the filesystem root to `target` inclusive — the
+  * breadcrumb rows of a listing, every one a jump target.
+  */
+ function ancestryCrumbs(target, dirnameOf, basenameOf) {
+     const crumbs = [];
+@@ -368,12 +428,31 @@ export class SshDirectoryPicker extends DirectoryPicker {
+         catch (error) {
+             signal?.throwIfAborted();
+             throw new DirectoryPickerError('directory-unreadable', target, `cannot list ${target}: ${messageOf(error)}`);
+         }
+         const entries = [];
+         let truncated = evicted;
++        // A drive root is the only local level where another drive can be
++        // reached at all: its real children live inside the current drive, so
++        // no listing of them can widen the browsable filesystem. The other
++        // accessible drive roots are therefore synthesised as rows here, which
++        // is what makes the drive switch in the browser's path tree work.
++        if (isWin32DriveRoot(target)) {
++            const current = target.slice(0, 2).toUpperCase();
++            const roots = await win32DriveRoots();
++            signal?.throwIfAborted();
++            for (const root of roots) {
++                if (root.slice(0, 2).toUpperCase() === current)
++                    continue;
++                if (entries.length === this.config.maxEntries) {
++                    truncated = true;
++                    break;
++                }
++                entries.push({ name: root, path: root, hidden: false });
++            }
++        }
+         for (const candidate of window) {
+             signal?.throwIfAborted();
+             const row = await localDirectoryRow(target, candidate.name, candidate.isDirectory, candidate.isSymbolicLink, signal);
+             if (row === null)
+                 continue;
+             if (entries.length === this.config.maxEntries) {
+@@ -441,8 +520,7 @@ export class SshDirectoryPicker extends DirectoryPicker {
+                 throw new DirectoryPickerError('directory-exists', target, `${target} already exists`);
+             }
+             throw new DirectoryPickerError('directory-create-failed', target, `cannot create ${target}: ${messageOf(error)}`);
+         }
+     }
+ }
+-export default SshDirectoryPicker;
+-//# sourceMappingURL=picker.js.map
+\ No newline at end of file
++export default SshDirectoryPicker;
+\ No newline at end of file

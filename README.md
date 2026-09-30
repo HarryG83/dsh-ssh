@@ -177,6 +177,12 @@ also removes its placeholder tree.
 the aggregate SSH connection). The client UI's remote connection list and
 remote directory browsing ride the `dsh-ssh/web` RPC channel instead.
 
+On Windows hosts the local side covers the whole machine: a level that is
+itself a drive root (`C:\`) also lists every other reachable drive (`D:\`, …)
+as a jump target, so the path tree can switch drives. Probing is bounded
+(500 ms per letter) and cached for 10 s, and a drive without ready media simply
+does not appear.
+
 ## Configuration reference (`dsh-ssh/ssh`)
 
 | Field | Type | Default | Description |
