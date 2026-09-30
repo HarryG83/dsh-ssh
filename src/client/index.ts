@@ -3,8 +3,9 @@
  * sidebar (saved connections, `~/.ssh/config` hosts, local entry) beside the
  * directory browser. Registered into both directory-flow holes, so mounting
  * `dsh-ssh` composes the whole picking interaction. Cross-plane calls ride the
- * shared web transport: local listing through the `workspaces` service (the
- * Host's `directoryPicker` browse capability) and remote listing/connection
+ * shared web transport: local listing through the client directory API
+ * (`uiWorkspace`, falling back to `workspaces` — the Host's `directoryPicker`
+ * browse capability) and remote listing/connection
  * management through the package's `/dsh-ssh` RPC channel.
  */
 
@@ -71,11 +72,31 @@ declare module '@deepseek-ai/cordis' {
       register(options: { name: string; inject?: (...args: never[]) => Record<string, unknown> }, component: unknown): () => void
     }
     workspaces: ClientWorkspaces
+    uiWorkspace?: ClientWorkspaces
   }
 }
 
 /** Required client services: the slot registry and the wire-facing workspace service. */
 export const inject = ['slots', 'workspaces']
+
+/**
+ * Resolve the browser-side directory API: dsh >= 0.2.0-rc.2 moved the
+ * `directoryPicker` browse capability from `workspaces` to `uiWorkspace`,
+ * while older builds still expose it on `workspaces`.
+ * @param ctx - client root context.
+ * @returns the service exposing listDirectory/createDirectory.
+ */
+function directoryApi(ctx: Context): ClientWorkspaces {
+  const uiWorkspace = ctx.get('uiWorkspace')
+  if (uiWorkspace !== undefined && typeof uiWorkspace.listDirectory === 'function') {
+    return uiWorkspace
+  }
+  const workspaces = ctx.get('workspaces')
+  if (workspaces !== undefined && typeof workspaces.listDirectory === 'function') {
+    return workspaces
+  }
+  throw new Error('dsh-ssh: no directory browsing service is available (uiWorkspace/workspaces)')
+}
 
 /**
  * Client plugin body: fill both directory-flow holes with the SSH workspace
@@ -85,8 +106,8 @@ export const inject = ['slots', 'workspaces']
  */
 export function apply(ctx: Context): void {
   const injected = (): Record<string, unknown> => ({
-    listLocalDirectory: (path?: string, signal?: AbortSignal) => ctx.workspaces.listDirectory(path, signal),
-    createLocalDirectory: (path: string, name: string) => ctx.workspaces.createDirectory(path, name),
+    listLocalDirectory: (path?: string, signal?: AbortSignal) => directoryApi(ctx).listDirectory(path, signal),
+    createLocalDirectory: (path: string, name: string) => directoryApi(ctx).createDirectory(path, name),
     rpc: (endpoint: string, payload?: unknown, signal?: AbortSignal) => {
       const connection = ctx.get('connection') as ClientConnection | undefined
       if (connection === undefined) {
