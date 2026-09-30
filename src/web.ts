@@ -1,12 +1,15 @@
 /**
  * Web-facing RPC channel of dsh-ssh: mounts the connection registry and
- * registers the `/dsh-ssh` unary channel on the shared web transport with the
- * loopback trust fence. The client half drives connection management and
- * remote directory browsing through it; endpoints are plain JSON.
+ * registers the `/dsh-ssh` unary channel directly on the web server, speaking
+ * the Connection client-request/server-response envelope behind the host's
+ * Host/Origin fence and browser authentication. The client half drives
+ * connection management and remote directory browsing through it; endpoints
+ * are plain JSON.
  * @module dsh-ssh/web
  */
 
 import { mkdir, rm } from 'node:fs/promises'
+import type { IncomingMessage, ServerResponse } from 'node:http'
 import { posix } from 'node:path'
 import type { SFTPWrapper, Stats } from 'ssh2'
 import type { Context } from '@deepseek-ai/cordis'
@@ -48,6 +51,12 @@ declare module '@deepseek-ai/cordis' {
   interface Context {
     /** Host connection transport; the shared RPC channel registry lives here. */
     connection: {
+      /**
+       * Admit one raw web request: the Host/Origin fence and browser
+       * authentication verdict. `rejection` is the status to answer with, or
+       * absent when the request is admitted.
+       */
+      admit(request: IncomingMessage): { rejection?: number }
       rpc: {
         handle(
           channel: string,
@@ -55,6 +64,14 @@ declare module '@deepseek-ai/cordis' {
           options: { authority: 'loopback' | 'trusted-host' },
         ): () => Promise<void>
       }
+    }
+    /** Host web server; the raw route registry the channel registers into. */
+    webServer: {
+      register(route: {
+        kind: 'prefix'
+        path: string
+        handler: (request: IncomingMessage, response: ServerResponse) => void
+      }): () => void
     }
   }
 }
@@ -136,6 +153,169 @@ const wireError = (code: string, message: string): ChannelResult => {
     return { ok: false, error: { code, message, details: { issues: [] } } }
   }
   return { ok: false, error: { code: 'internal', message, details: {} } }
+}
+
+/** The dedicated unary RPC channel this module owns. */
+const CHANNEL_PATH = '/dsh-ssh'
+
+/** One endpoint segment, mirroring the Connection RPC host's alphabet. */
+const ENDPOINT_SEGMENT_PATTERN = /^[A-Za-z0-9_$.-]+$/
+
+/** Correlation id used when a malformed envelope carries no usable rpcId. */
+const INVALID_REQUEST_RPC_ID = 'invalid-request'
+
+/** Body cap for this JSON-only channel; the core default (300 MiB) guards attachments. */
+const MAX_BODY_BYTES = 4 * 1024 * 1024
+
+/** Resolve the endpoint one channel path names, or undefined when it names none. */
+function endpointFromPath(pathname: string): string | undefined {
+  if (!pathname.startsWith(`${CHANNEL_PATH}/`)) {
+    return undefined
+  }
+  const endpoint = pathname.slice(CHANNEL_PATH.length + 1)
+  const segments = endpoint.split('/')
+  if (segments.some((segment) => segment === '' || segment === '.' || segment === '..' || !ENDPOINT_SEGMENT_PATTERN.test(segment))) {
+    return undefined
+  }
+  return endpoint
+}
+
+/** Write one plain-text response. */
+function sendText(res: ServerResponse, status: number, text: string): void {
+  res.writeHead(status, { 'content-type': 'text/plain; charset=utf-8' })
+  res.end(text)
+}
+
+/** Write one JSON response — the envelope the client transport parses. */
+function sendJson(res: ServerResponse, status: number, body: unknown): void {
+  res.writeHead(status, { 'content-type': 'application/json; charset=utf-8' })
+  res.end(JSON.stringify(body))
+}
+
+/** One failure envelope in the host's closed RPC error vocabulary. */
+function failureEnvelope(
+  rpcId: string,
+  error: { code: string; message: string; details?: Record<string, unknown> },
+): { type: 'server-response'; rpcId: string; result: ChannelResult } {
+  return { type: 'server-response', rpcId, result: { ok: false, error } }
+}
+
+/**
+ * Buffer one request body, answering 413 for an oversized payload. Resolves
+ * undefined once a response has already been written.
+ */
+function readBody(req: IncomingMessage, res: ServerResponse): Promise<string | undefined> {
+  return new Promise<string | undefined>((resolvePromise) => {
+    const chunks: Buffer[] = []
+    let size = 0
+    let settled = false
+    const settle = (value: string | undefined): void => {
+      if (!settled) {
+        settled = true
+        resolvePromise(value)
+      }
+    }
+    const declared = Number(req.headers['content-length'])
+    if (Number.isFinite(declared) && declared > MAX_BODY_BYTES) {
+      sendText(res, 413, 'payload too large')
+      req.resume()
+      settle(undefined)
+      return
+    }
+    req.on('data', (chunk: Buffer) => {
+      if (settled) {
+        return
+      }
+      size += chunk.length
+      if (size > MAX_BODY_BYTES) {
+        sendText(res, 413, 'payload too large')
+        settle(undefined)
+        req.destroy()
+        return
+      }
+      chunks.push(chunk)
+    })
+    req.on('end', () => settle(Buffer.concat(chunks).toString('utf8')))
+    req.on('error', () => {
+      sendText(res, 400, 'body is not readable')
+      settle(undefined)
+    })
+  })
+}
+
+/**
+ * Serve one `/dsh-ssh` request in the Connection RPC envelope: the Host/Origin
+ * fence and browser authentication come from `connection.admit`, then the
+ * endpoint runs with a request-scoped abort signal and its result is wrapped
+ * in a `server-response` envelope.
+ */
+async function handleChannelRequest(
+  connection: Context['connection'],
+  dispatch: (endpoint: string, payload: unknown, signal: AbortSignal) => Promise<ChannelResult>,
+  req: IncomingMessage,
+  res: ServerResponse,
+): Promise<void> {
+  const admission = connection.admit(req)
+  if (admission.rejection !== undefined) {
+    sendText(res, admission.rejection, admission.rejection === 401 ? 'unauthorized' : 'forbidden')
+    return
+  }
+  const endpoint = endpointFromPath(new URL(req.url ?? '/', 'http://localhost').pathname)
+  if (req.method !== 'POST' || endpoint === undefined) {
+    sendText(res, 404, 'not found')
+    return
+  }
+  const contentType = req.headers['content-type']?.split(';', 1)[0]?.trim().toLowerCase()
+  if (contentType !== 'application/json') {
+    sendText(res, 415, 'content type must be application/json')
+    return
+  }
+  const body = await readBody(req, res)
+  if (body === undefined) {
+    return
+  }
+  let parsed: unknown
+  try {
+    parsed = JSON.parse(body)
+  } catch {
+    sendText(res, 400, 'body is not JSON')
+    return
+  }
+  const rpcId = isRecord(parsed) && isString(parsed.rpcId) ? parsed.rpcId : undefined
+  if (!isRecord(parsed) || parsed.type !== 'client-request' || rpcId === undefined || !isString(parsed.method)) {
+    sendJson(res, 200, failureEnvelope(rpcId ?? INVALID_REQUEST_RPC_ID, {
+      code: 'gateway/bad-request',
+      message: 'invalid client-request message',
+      details: { issues: [] },
+    }))
+    return
+  }
+  if (parsed.method !== endpoint) {
+    sendJson(res, 200, failureEnvelope(rpcId, {
+      code: 'gateway/bad-request',
+      message: `method ${JSON.stringify(parsed.method)} does not match endpoint ${JSON.stringify(endpoint)}`,
+      details: { issues: [] },
+    }))
+    return
+  }
+  const controller = new AbortController()
+  const abortIfPending = (): void => {
+    if (!res.writableEnded) {
+      controller.abort()
+    }
+  }
+  req.once('aborted', abortIfPending)
+  res.once('close', abortIfPending)
+  try {
+    const result = await dispatch(endpoint, parsed.payload, controller.signal)
+    if (!res.writableEnded && !res.destroyed) {
+      sendJson(res, 200, { type: 'server-response', rpcId, result })
+    }
+  } catch (error) {
+    if (!res.writableEnded && !res.destroyed) {
+      sendText(res, 500, `handler failure: ${String(error)}`)
+    }
+  }
 }
 
 /** Ancestor chain from the remote root to `target` inclusive. */
@@ -333,6 +513,19 @@ export function apply(ctx: Context, config: WebChannelConfig): void {
     }
   }
 
-  const dispose = ctx.connection.rpc.handle('/dsh-ssh', dispatch, { authority: 'loopback' })
-  ctx.effect(() => dispose, 'dsh-ssh: /dsh-ssh rpc channel')
+  // Register the channel directly on the web server. dsh 0.2.0-rc.2's
+  // `connection.rpc.handle()` resolves `webServer` through the connection
+  // service's own shadowed context instead of the caller's, so every
+  // non-core caller throws `cannot get property "webServer" without inject`
+  // and the channel never registers. This route speaks the same
+  // client-request/server-response envelope while the Host/Origin fence and
+  // browser authentication still come from admitting through `connection`.
+  ctx.inject(['webServer'], (webCtx) => {
+    const route = {
+      kind: 'prefix' as const,
+      path: CHANNEL_PATH,
+      handler: (req: IncomingMessage, res: ServerResponse) => handleChannelRequest(webCtx.connection, dispatch, req, res),
+    }
+    webCtx.effect(() => webCtx.webServer.register(route), 'dsh-ssh: /dsh-ssh rpc channel')
+  })
 }
