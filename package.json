@@ -7,12 +7,12 @@
   "author": "yuunagi_cn <yuunagi.cn@outlook.com>",
   "repository": {
     "type": "git",
-    "url": "https://github.com/UynajGI/dsh-ssh.git"
+    "url": "https://github.com/HarryG83/dsh-ssh.git"
   },
   "bugs": {
-    "url": "https://github.com/UynajGI/dsh-ssh/issues"
+    "url": "https://github.com/HarryG83/dsh-ssh/issues"
   },
-  "homepage": "https://github.com/UynajGI/dsh-ssh",
+  "homepage": "https://github.com/HarryG83/dsh-ssh",
   "main": "lib/index.js",
   "types": "lib/index.d.ts",
   "exports": {
