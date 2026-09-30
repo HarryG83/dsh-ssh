@@ -6,8 +6,8 @@
   <img src="https://img.shields.io/npm/v/dsh-ssh" alt="npm 版本">
   <img src="https://img.shields.io/npm/l/dsh-ssh" alt="许可证">
   <img src="https://img.shields.io/badge/node-%3E%3D22-339933" alt="Node 版本">
-  <img src="https://img.shields.io/github/actions/workflow/status/UynajGI/dsh-ssh/ci.yml?label=CI" alt="CI 状态">
-  <img src="https://img.shields.io/github/stars/UynajGI/dsh-ssh" alt="GitHub Stars">
+  <img src="https://img.shields.io/github/actions/workflow/status/HarryG83/dsh-ssh/ci.yml?label=CI" alt="CI 状态">
+  <img src="https://img.shields.io/github/stars/HarryG83/dsh-ssh" alt="GitHub Stars">
   <img src="https://img.shields.io/badge/dsh-plugin-2ea44f" alt="dsh-plugin">
 </p>
 
