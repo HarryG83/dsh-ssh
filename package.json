@@ -73,7 +73,7 @@
   "scripts": {
     "build": "tsc && tsdown",
     "typecheck": "tsc --noEmit",
-    "prepare": "husky",
+    "prepare": "husky || true",
     "prepublishOnly": "npm run typecheck && npm run build",
     "release": "commit-and-tag-version"
   },
